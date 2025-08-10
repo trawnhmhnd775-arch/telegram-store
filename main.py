@@ -1,40 +1,237 @@
-import os
+import telebot
+from telebot import types
 import json
-from telebot import TeleBot, types
+import os
 from dotenv import load_dotenv
-from uuid import uuid4
 
-# تحميل القيم من .env
+# تحميل المتغيرات من .env
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-bot = TeleBot(TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
 DATA_FILE = "data.json"
 
-# تحميل أو إنشاء قاعدة البيانات
-try:
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except FileNotFoundError:
-    data = {"users": {}, "welcome": "أهلاً بك في البوت!", "menus": []}
+# تحميل البيانات أو إنشاء ملف جديد
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump({"users": {}, "welcome": "أهلاً بك في البوت!", "menus": []}, f, ensure_ascii=False, indent=2)
 
-def save_data():
+def load_data():
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def ensure_user(uid):
-    uid = str(uid)
-    if uid not in data["users"]:
-        data["users"][uid] = {"balance": 0.0, "banned": False}
-        save_data()
-    return data["users"][uid]
+# استقبال /start
+@bot.message_handler(commands=['start'])
+def start(message):
+    data = load_data()
+    user_id = str(message.from_user.id)
 
-def admin_only(func):
-    def wrapper(message):
-        if message.from_user.id != ADMIN_ID:
-            bot.send_message(message.chat.id, "🚫 ليس لديك صلاحية.")
+    # إذا المستخدم جديد
+    if user_id not in data["users"]:
+        data["users"][user_id] = {"balance": 0, "banned": False}
+        save_data(data)
+
+    if data["users"][user_id]["banned"]:
+        bot.reply_to(message, "🚫 أنت محظور من استخدام هذا البوت.")
+        return
+
+    show_main_menu(message.chat.id)
+
+def show_main_menu(chat_id):
+    data = load_data()
+    markup = types.InlineKeyboardMarkup()
+    for idx, menu in enumerate(data["menus"]):
+        markup.add(types.InlineKeyboardButton(menu["title"], callback_data=f"main_{idx}"))
+    bot.send_message(chat_id, data["welcome"], reply_markup=markup)
+
+def show_sub_menu(chat_id, menu_index):
+    data = load_data()
+    menu = data["menus"][menu_index]
+    markup = types.InlineKeyboardMarkup()
+    for idx, submenu in enumerate(menu["submenus"]):
+        markup.add(types.InlineKeyboardButton(submenu["title"], callback_data=f"sub_{menu_index}_{idx}"))
+    markup.add(types.InlineKeyboardButton("⬅️ رجوع", callback_data="back_main"))
+    bot.send_message(chat_id, f"📂 {menu['title']}", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    data = load_data()
+    if call.data.startswith("main_"):
+        idx = int(call.data.split("_")[1])
+        show_sub_menu(call.message.chat.id, idx)
+
+    elif call.data.startswith("sub_"):
+        menu_idx, sub_idx = map(int, call.data.split("_")[1:])
+        submenu = data["menus"][menu_idx]["submenus"][sub_idx]
+        markup = types.InlineKeyboardMarkup()
+        for btn in submenu.get("buttons", []):
+            markup.add(types.InlineKeyboardButton(btn["text"], url=btn["url"]))
+        markup.add(types.InlineKeyboardButton("⬅️ رجوع", callback_data=f"main_{menu_idx}"))
+
+        if submenu.get("image"):
+            bot.send_photo(call.message.chat.id, submenu["image"], caption=submenu["text"], reply_markup=markup)
+        else:
+            bot.send_message(call.message.chat.id, submenu["text"], reply_markup=markup)
+
+    elif call.data == "back_main":
+        show_main_menu(call.message.chat.id)
+
+# أوامر الأدمن
+@bot.message_handler(commands=['set_welcome'])
+def set_welcome(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل رسالة الترحيب الجديدة:")
+    bot.register_next_step_handler(msg, save_welcome)
+
+def save_welcome(message):
+    data = load_data()
+    data["welcome"] = message.text
+    save_data(data)
+    bot.reply_to(message, "✅ تم تحديث رسالة الترحيب.")
+
+@bot.message_handler(commands=['add_balance'])
+def add_balance(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل ID المستخدم والمبلغ هكذا: 123456 10")
+    bot.register_next_step_handler(msg, process_add_balance)
+
+def process_add_balance(message):
+    try:
+        user_id, amount = message.text.split()
+        data = load_data()
+        if user_id not in data["users"]:
+            bot.reply_to(message, "❌ المستخدم غير موجود.")
             return
+        data["users"][user_id]["balance"] += float(amount)
+        save_data(data)
+        bot.send_message(user_id, f"💰 تم إضافة {amount}$ إلى حسابك.")
+        bot.reply_to(message, "✅ تم إضافة الرصيد.")
+    except:
+        bot.reply_to(message, "❌ صيغة غير صحيحة.")
+
+@bot.message_handler(commands=['remove_balance'])
+def remove_balance(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل ID المستخدم والمبلغ هكذا: 123456 5")
+    bot.register_next_step_handler(msg, process_remove_balance)
+
+def process_remove_balance(message):
+    try:
+        user_id, amount = message.text.split()
+        data = load_data()
+        if user_id not in data["users"]:
+            bot.reply_to(message, "❌ المستخدم غير موجود.")
+            return
+        data["users"][user_id]["balance"] -= float(amount)
+        save_data(data)
+        bot.send_message(user_id, f"💸 تم خصم {amount}$ من حسابك.")
+        bot.reply_to(message, "✅ تم خصم الرصيد.")
+    except:
+        bot.reply_to(message, "❌ صيغة غير صحيحة.")
+
+@bot.message_handler(commands=['ban'])
+def ban_user(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل ID المستخدم لحظره:")
+    bot.register_next_step_handler(msg, process_ban)
+
+def process_ban(message):
+    user_id = message.text.strip()
+    data = load_data()
+    if user_id in data["users"]:
+        data["users"][user_id]["banned"] = True
+        save_data(data)
+        bot.reply_to(message, "✅ تم حظر المستخدم.")
+    else:
+        bot.reply_to(message, "❌ المستخدم غير موجود.")
+
+@bot.message_handler(commands=['unban'])
+def unban_user(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل ID المستخدم لفك الحظر:")
+    bot.register_next_step_handler(msg, process_unban)
+
+def process_unban(message):
+    user_id = message.text.strip()
+    data = load_data()
+    if user_id in data["users"]:
+        data["users"][user_id]["banned"] = False
+        save_data(data)
+        bot.reply_to(message, "✅ تم فك الحظر.")
+    else:
+        bot.reply_to(message, "❌ المستخدم غير موجود.")
+
+# إدارة القوائم
+@bot.message_handler(commands=['add_main_menu'])
+def add_main_menu(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل اسم القائمة الرئيسية:")
+    bot.register_next_step_handler(msg, save_main_menu)
+
+def save_main_menu(message):
+    data = load_data()
+    data["menus"].append({"title": message.text, "submenus": []})
+    save_data(data)
+    bot.reply_to(message, "✅ تم إضافة القائمة الرئيسية.")
+
+@bot.message_handler(commands=['add_submenu'])
+def add_submenu(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "أرسل رقم القائمة الرئيسية:")
+    bot.register_next_step_handler(msg, process_add_submenu_step1)
+
+def process_add_submenu_step1(message):
+    menu_index = int(message.text)
+    msg = bot.reply_to(message, "أرسل اسم الزر الفرعي:")
+    bot.register_next_step_handler(msg, process_add_submenu_step2, menu_index)
+
+def process_add_submenu_step2(message, menu_index):
+    title = message.text
+    msg = bot.reply_to(message, "أرسل النص:")
+    bot.register_next_step_handler(msg, process_add_submenu_step3, menu_index, title)
+
+def process_add_submenu_step3(message, menu_index, title):
+    text = message.text
+    msg = bot.reply_to(message, "أرسل رابط الصورة أو اكتب 'لا' إذا لا يوجد:")
+    bot.register_next_step_handler(msg, process_add_submenu_step4, menu_index, title, text)
+
+def process_add_submenu_step4(message, menu_index, title, text):
+    image = None if message.text.lower() == "لا" else message.text
+    msg = bot.reply_to(message, "أرسل الأزرار بصيغة نص|رابط، سطر لكل زر، أو اكتب 'لا':")
+    bot.register_next_step_handler(msg, process_add_submenu_final, menu_index, title, text, image)
+
+def process_add_submenu_final(message, menu_index, title, text, image):
+    buttons = []
+    if message.text.lower() != "لا":
+        for line in message.text.split("\n"):
+            parts = line.split("|")
+            if len(parts) == 2:
+                buttons.append({"text": parts[0], "url": parts[1]})
+
+    data = load_data()
+    data["menus"][menu_index]["submenus"].append({
+        "title": title,
+        "text": text,
+        "image": image,
+        "buttons": buttons
+    })
+    save_data(data)
+    bot.reply_to(message, "✅ تم إضافة القائمة الفرعية.")
+
+bot.infinity_polling()            return
         func(message)
     return wrapper
 
